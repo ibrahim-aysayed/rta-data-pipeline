@@ -1,0 +1,169 @@
+"""Generate messy Real-Time Analyst (RTA) datasets for a contact center.
+
+Creates three raw extracts in data/raw/:
+  * agent_states.csv  - agent state intervals (On Call, Break, ...)
+  * schedule.csv      - planned activities per agent per day
+  * call_intervals.csv - 30-minute queue statistics
+
+The files mimic real exports: state-name variants, mixed timestamp formats,
+missing end times, overlaps, duplicates and impossible values.
+"""
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+RNG = np.random.default_rng(7)
+OUT = Path("data/raw")
+N_AGENTS = 24
+TEAMS = ["Support", "Sales", "Billing"]
+DAYS = pd.date_range("2026-11-02", periods=5, freq="D")
+
+VARIANTS = {
+    "On Call": ["ON_CALL", "on call", "Talking"],
+    "Available": ["AVAILABLE", "Ready"],
+    "After Call Work": ["ACW", "acw"],
+    "Break": ["BREAK", "Short Break"],
+    "Lunch": ["LUNCH", "Meal"],
+    "Not Ready": ["NOT_READY", "Aux"],
+}
+FMT_ISO = "%Y-%m-%d %H:%M:%S"
+FMT_DMY = "%d/%m/%Y %H:%M:%S"
+
+
+def schedule_blocks(offset_min: int):
+    def t(h, m):
+        return pd.Timedelta(hours=h, minutes=m + offset_min)
+
+    return [
+        ("Work", t(9, 0), t(11, 0)),
+        ("Break", t(11, 0), t(11, 15)),
+        ("Work", t(11, 15), t(13, 0)),
+        ("Lunch", t(13, 0), t(13, 45)),
+        ("Work", t(13, 45), t(15, 30)),
+        ("Break", t(15, 30), t(15, 45)),
+        ("Work", t(15, 45), t(17, 0)),
+    ]
+
+
+def simulate_day(day, blocks):
+    """Simulate what the agent actually did (with realistic deviations)."""
+    rows = []
+    cursor = day + blocks[0][1] + pd.Timedelta(minutes=int(max(0, RNG.normal(1, 3))))
+
+    def add(state, seconds, limit=None):
+        nonlocal cursor
+        end = cursor + pd.Timedelta(seconds=int(seconds))
+        if limit is not None and end > limit:
+            end = limit
+        if end > cursor:
+            rows.append((state, cursor, end))
+            cursor = end
+
+    for kind, s, e in blocks:
+        if kind == "Work":
+            target = day + e + pd.Timedelta(minutes=int(RNG.choice([-1, 0, 0, 0, 0, 1, 2])))
+            while cursor < target:
+                add("Available", RNG.integers(5, 90), target)
+                add("On Call", RNG.integers(120, 600), target)
+                add("After Call Work", RNG.integers(20, 90), target)
+                if RNG.random() < 0.04:
+                    add("Not Ready", RNG.integers(300, 1200), target)
+        else:
+            extra = int(RNG.choice([0, 0, 0, 1, 3, 6, 10, 15]))
+            add(kind, ((e - s).total_seconds()) + extra * 60)
+    return rows
+
+
+def build_states_and_schedule():
+    sched_rows, state_rows = [], []
+    for i in range(N_AGENTS):
+        agent = f"A{i + 1:03d}"
+        team = TEAMS[i % 3]
+        offset = [0, 30, 60][(i // 3) % 3]
+        for day in DAYS:
+            blocks = schedule_blocks(offset)
+            for act, s, e in blocks:
+                sched_rows.append((agent, act, day + s, day + e))
+            for st, s, e in simulate_day(day, blocks):
+                state_rows.append((agent, team, st, s, e))
+    states = pd.DataFrame(state_rows, columns=["Agent ID", "Team", "State", "Start Time", "End Time"])
+    sched = pd.DataFrame(sched_rows, columns=["Agent ID", "Activity", "Start Time", "End Time"])
+    return states, sched
+
+
+def messy_states(states: pd.DataFrame) -> pd.DataFrame:
+    n = len(states)
+    states = states.copy()
+
+    def pick(s):
+        return s if RNG.random() < 0.7 else RNG.choice(VARIANTS[s])
+
+    states["State"] = [pick(s) for s in states["State"]]
+
+    # overlaps and impossible intervals
+    idx = RNG.choice(n, int(n * 0.005), replace=False)
+    states.loc[idx, "End Time"] += pd.Timedelta(minutes=3)
+    idx = RNG.choice(n, int(n * 0.005), replace=False)
+    states.loc[idx, "End Time"] = states.loc[idx, "Start Time"] - pd.Timedelta(seconds=60)
+
+    # mixed timestamp formats
+    dmy = RNG.random(n) < 0.25
+    for col in ["Start Time", "End Time"]:
+        states[col] = np.where(dmy, states[col].dt.strftime(FMT_DMY), states[col].dt.strftime(FMT_ISO))
+
+    # missing end times, messy agent ids
+    states.loc[RNG.choice(n, int(n * 0.01), replace=False), "End Time"] = np.nan
+    idx = RNG.choice(n, int(n * 0.03), replace=False)
+    states.loc[idx, "Agent ID"] = states.loc[idx, "Agent ID"].str.lower()
+    idx = RNG.choice(n, int(n * 0.03), replace=False)
+    states.loc[idx, "Agent ID"] = " " + states.loc[idx, "Agent ID"] + " "
+
+    dups = states.sample(int(n * 0.01), random_state=1)
+    return pd.concat([states, dups], ignore_index=True).sample(frac=1, random_state=3).reset_index(drop=True)
+
+
+def build_calls() -> pd.DataFrame:
+    rows = []
+    for day in DAYS:
+        for q in TEAMS:
+            for k in range(18):
+                start = day + pd.Timedelta(hours=9, minutes=30 * k)
+                hour = start.hour + start.minute / 60
+                lam = 12 + 28 * np.exp(-(((hour - 12.5) / 2.2) ** 2))
+                offered = int(RNG.poisson(lam))
+                aband = int(RNG.binomial(offered, RNG.uniform(0.02, 0.12)))
+                answered = offered - aband
+                within = int(RNG.binomial(answered, RNG.uniform(0.6, 0.95))) if answered > 0 else 0
+                rows.append((start, q, offered, answered, aband, within, round(RNG.normal(380, 40), 1)))
+    df = pd.DataFrame(rows, columns=["Interval Start", "Queue", "Offered", "Answered", "Abandoned",
+                                     "Answered Within SLA", "AHT (sec)"])
+    n = len(df)
+    df["Offered"] = df["Offered"].astype(float)
+
+    dmy = RNG.random(n) < 0.2
+    df["Interval Start"] = np.where(dmy, df["Interval Start"].dt.strftime(FMT_DMY),
+                                    df["Interval Start"].dt.strftime(FMT_ISO))
+    idx = RNG.choice(n, 10, replace=False)
+    df.loc[idx, "Queue"] = df.loc[idx, "Queue"].str.lower() + " "
+    df.loc[RNG.choice(n, 8, replace=False), "Answered"] += 20      # answered > offered
+    df.loc[RNG.choice(n, 4, replace=False), "Abandoned"] = -3      # negative
+    df.loc[RNG.choice(n, 6, replace=False), "AHT (sec)"] = np.nan  # missing AHT
+    df.loc[RNG.choice(n, 3, replace=False), "Offered"] = np.nan    # missing volume
+    dups = df.sample(8, random_state=2)
+    return pd.concat([df, dups], ignore_index=True).sample(frac=1, random_state=5).reset_index(drop=True)
+
+
+if __name__ == "__main__":
+    OUT.mkdir(parents=True, exist_ok=True)
+    states, sched = build_states_and_schedule()
+    sched_out = sched.copy()
+    for c in ["Start Time", "End Time"]:
+        sched_out[c] = sched_out[c].dt.strftime(FMT_ISO)
+    messy = messy_states(states)
+    calls = build_calls()
+    messy.to_csv(OUT / "agent_states.csv", index=False)
+    sched_out.to_csv(OUT / "schedule.csv", index=False)
+    calls.to_csv(OUT / "call_intervals.csv", index=False)
+    print(f"agent_states.csv: {len(messy):,} rows | schedule.csv: {len(sched_out):,} rows | "
+          f"call_intervals.csv: {len(calls):,} rows")

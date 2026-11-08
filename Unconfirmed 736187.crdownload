@@ -1,0 +1,359 @@
+"""Real-Time Analyst (RTA) data preparation, validation and alerting pipeline.
+
+Steps: load -> standardize -> clean -> validate -> KPIs -> alerts -> Excel report.
+
+Usage:
+    python rta_pipeline.py --indir data/raw --outdir output
+    python rta_pipeline.py --watch 60        # re-run whenever the raw files change
+"""
+import argparse
+import logging
+import re
+import time
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s",
+                    datefmt="%H:%M:%S")
+log = logging.getLogger("rta")
+
+STATE_MAP = {
+    "on call": "On Call", "talking": "On Call",
+    "available": "Available", "ready": "Available",
+    "after call work": "After Call Work", "acw": "After Call Work",
+    "break": "Break", "short break": "Break",
+    "lunch": "Lunch", "meal": "Lunch",
+    "not ready": "Not Ready", "aux": "Not Ready",
+}
+STATES = ["Available", "On Call", "After Call Work", "Break", "Lunch", "Not Ready"]
+PRODUCTIVE = {"Available", "On Call", "After Call Work"}
+SCHEDULE_OK = {"Work": PRODUCTIVE, "Break": {"Break"}, "Lunch": {"Lunch"}}
+LIMITS_MIN = {"Break": 20, "Lunch": 50, "Not Ready": 10}          # max minutes before alert
+TARGETS = {"adherence_pct": 85.0, "service_level_pct": 80.0, "abandon_rate_pct": 5.0}
+MIN_VOLUME_FOR_ALERT = 10
+
+
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
+def load(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path, dtype=str)
+    df.columns = [re.sub(r"[^0-9a-z]+", "_", c.lower()).strip("_") for c in df.columns]
+    log.info("Loaded %-20s %s rows", path.name, f"{len(df):,}")
+    return df
+
+
+def parse_ts(s: pd.Series) -> pd.Series:
+    s = s.str.strip()
+    iso = pd.to_datetime(s, format="%Y-%m-%d %H:%M:%S", errors="coerce")
+    dmy = pd.to_datetime(s, format="%d/%m/%Y %H:%M:%S", errors="coerce")
+    return iso.fillna(dmy)
+
+
+def reject_log(df: pd.DataFrame):
+    """Return (flag function, reasons series) used to tag rows that must be rejected."""
+    reasons = pd.Series("", index=df.index)
+
+    def flag(mask, text):
+        mask = mask.fillna(False)
+        reasons.loc[mask] = reasons.loc[mask] + text + "; "
+
+    return flag, reasons
+
+
+# --------------------------------------------------------------------------- #
+# Cleaning
+# --------------------------------------------------------------------------- #
+def clean_states(df: pd.DataFrame):
+    steps = []
+    df = df.copy()
+    df["agent_id"] = df["agent_id"].str.strip().str.upper()
+    df["team"] = df["team"].str.strip().str.title()
+    df["state"] = df["state"].str.strip().str.lower().str.replace("_", " ", regex=False).map(STATE_MAP)
+    df["start_time"] = parse_ts(df["start_time"])
+    df["end_time"] = parse_ts(df["end_time"])
+
+    n = len(df)
+    df = df.drop_duplicates()
+    steps.append(("States: duplicate rows removed", n - len(df)))
+
+    df = df.sort_values(["agent_id", "start_time"]).reset_index(drop=True)
+    nxt = df.groupby("agent_id")["start_time"].shift(-1)
+    miss = df["end_time"].isna() & nxt.notna() & ((nxt - df["start_time"]) < pd.Timedelta(hours=2))
+    df.loc[miss, "end_time"] = nxt[miss]
+    steps.append(("States: missing end_time filled from next state", int(miss.sum())))
+
+    flag, reasons = reject_log(df)
+    flag(df["agent_id"].isna() | (df["agent_id"] == ""), "missing_agent")
+    flag(df["state"].isna(), "unknown_state")
+    flag(df["start_time"].isna(), "invalid_start")
+    flag(df["end_time"].isna(), "invalid_end")
+    flag(df["end_time"] <= df["start_time"], "end_before_start")
+    bad = reasons != ""
+    rejected = df[bad].assign(reject_reason=reasons[bad].str.rstrip("; "))
+    steps.append(("States: invalid rows rejected", int(bad.sum())))
+
+    good = df[~bad].sort_values(["agent_id", "start_time"]).reset_index(drop=True)
+    nxt = good.groupby("agent_id")["start_time"].shift(-1)
+    ov = good["end_time"] > nxt
+    good.loc[ov, "end_time"] = nxt[ov]
+    steps.append(("States: overlapping intervals trimmed", int(ov.sum())))
+
+    good["duration_sec"] = (good["end_time"] - good["start_time"]).dt.total_seconds()
+    zero = good["duration_sec"] <= 0
+    good = good[~zero].reset_index(drop=True)
+    steps.append(("States: zero-length intervals dropped after trimming", int(zero.sum())))
+    good["date"] = good["start_time"].dt.strftime("%Y-%m-%d")
+    return good, rejected.reset_index(drop=True), steps
+
+
+def clean_schedule(df: pd.DataFrame):
+    df = df.copy()
+    df["agent_id"] = df["agent_id"].str.strip().str.upper()
+    df["activity"] = df["activity"].str.strip().str.title()
+    df["start_time"] = parse_ts(df["start_time"])
+    df["end_time"] = parse_ts(df["end_time"])
+    n = len(df)
+    df = df.drop_duplicates()
+    valid = df["start_time"].notna() & df["end_time"].notna() & (df["end_time"] > df["start_time"])
+    steps = [("Schedule: duplicates removed", n - len(df)),
+             ("Schedule: invalid rows dropped", int((~valid).sum()))]
+    return df[valid].reset_index(drop=True), steps
+
+
+def clean_calls(df: pd.DataFrame):
+    steps = []
+    df = df.copy()
+    df["queue"] = df["queue"].str.strip().str.title()
+    df["interval_start"] = parse_ts(df["interval_start"])
+    count_cols = ["offered", "answered", "abandoned", "answered_within_sla"]
+    for c in count_cols + ["aht_sec"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    n = len(df)
+    df = df.drop_duplicates()
+    steps.append(("Calls: duplicate rows removed", n - len(df)))
+
+    flag, reasons = reject_log(df)
+    flag(df["interval_start"].isna(), "invalid_interval")
+    flag(df["queue"].isna() | (df["queue"] == ""), "missing_queue")
+    flag(df[count_cols].isna().any(axis=1), "missing_counts")
+    flag((df[count_cols] < 0).any(axis=1), "negative_counts")
+    flag(df["answered"] + df["abandoned"] > df["offered"], "answered_plus_abandoned_gt_offered")
+    flag(df["answered_within_sla"] > df["answered"], "within_sla_gt_answered")
+    bad = reasons != ""
+    rejected = df[bad].assign(reject_reason=reasons[bad].str.rstrip("; "))
+    good = df[~bad].copy()
+    steps.append(("Calls: invalid rows rejected", int(bad.sum())))
+    steps.append(("Calls: rows with missing AHT (kept, excluded from AHT)", int(good["aht_sec"].isna().sum())))
+
+    good["date"] = good["interval_start"].dt.strftime("%Y-%m-%d")
+    good["service_level_pct"] = np.where(good["offered"] > 0,
+                                         good["answered_within_sla"] / good["offered"] * 100, np.nan)
+    good["abandon_rate_pct"] = np.where(good["offered"] > 0,
+                                        good["abandoned"] / good["offered"] * 100, np.nan)
+    return good.sort_values(["queue", "interval_start"]).reset_index(drop=True), rejected.reset_index(drop=True), steps
+
+
+# --------------------------------------------------------------------------- #
+# KPIs
+# --------------------------------------------------------------------------- #
+def lookup(minutes, starts, ends, values):
+    """For each minute return the value of the interval covering it (or None)."""
+    idx = np.searchsorted(starts, minutes, side="right") - 1
+    safe = np.clip(idx, 0, None)
+    ok = (idx >= 0) & (minutes < ends[safe])
+    out = np.empty(len(minutes), dtype=object)
+    out[:] = None
+    out[ok] = values[safe][ok]
+    return out
+
+
+def adherence_table(states: pd.DataFrame, sched: pd.DataFrame) -> pd.DataFrame:
+    ns = "datetime64[ns]"
+    by_agent = {a: g for a, g in states.groupby("agent_id")}
+    sched = sched.assign(date=sched["start_time"].dt.strftime("%Y-%m-%d"))
+    rows = []
+    for (agent, date), sg in sched.groupby(["agent_id", "date"]):
+        sg = sg.sort_values("start_time")
+        minutes = pd.date_range(sg["start_time"].min(), sg["end_time"].max(), freq="1min",
+                                inclusive="left").to_numpy(ns)
+        planned = lookup(minutes, sg["start_time"].to_numpy(ns), sg["end_time"].to_numpy(ns),
+                         sg["activity"].to_numpy(dtype=object))
+        ag = by_agent.get(agent)
+        if ag is None:
+            actual = np.full(len(minutes), None, dtype=object)
+        else:
+            actual = lookup(minutes, ag["start_time"].to_numpy(ns), ag["end_time"].to_numpy(ns),
+                            ag["state"].to_numpy(dtype=object))
+        hits = sum(1 for p, a in zip(planned, actual) if p is not None and a in SCHEDULE_OK.get(p, ()))
+        total = sum(1 for p in planned if p is not None)
+        rows.append((agent, date, total, hits))
+    out = pd.DataFrame(rows, columns=["agent_id", "date", "scheduled_min", "adherent_min"])
+    out["adherence_pct"] = (out["adherent_min"] / out["scheduled_min"] * 100).round(1)
+    return out
+
+
+def agent_daily(states: pd.DataFrame, adh: pd.DataFrame) -> pd.DataFrame:
+    mins = (states.groupby(["agent_id", "date", "state"])["duration_sec"].sum() / 60).unstack(fill_value=0)
+    mins = mins.reindex(columns=STATES, fill_value=0).reset_index()
+    team = states.groupby("agent_id")["team"].first().rename("team").reset_index()
+    out = adh.merge(mins, on=["agent_id", "date"], how="left").merge(team, on="agent_id", how="left")
+    busy = out["On Call"] + out["After Call Work"]
+    out["logged_in_min"] = out[STATES].sum(axis=1)
+    out["occupancy_pct"] = (busy / (busy + out["Available"]) * 100).round(1)
+    out["shrinkage_pct"] = ((out["Break"] + out["Lunch"] + out["Not Ready"]) / out["logged_in_min"] * 100).round(1)
+    cols = ["agent_id", "team", "date", "scheduled_min", "adherent_min", "adherence_pct", "logged_in_min",
+            "occupancy_pct", "shrinkage_pct"] + STATES
+    return out[cols].round(1)
+
+
+def team_summary(daily: pd.DataFrame) -> pd.DataFrame:
+    return (daily.groupby("team")[["adherence_pct", "occupancy_pct", "shrinkage_pct"]].mean().round(1)
+            .reset_index())
+
+
+def queue_daily(calls: pd.DataFrame) -> pd.DataFrame:
+    g = calls.assign(w=np.where(calls["aht_sec"].notna(), calls["answered"], 0),
+                     aht_x=calls["aht_sec"].fillna(0) * calls["answered"])
+    out = g.groupby(["queue", "date"]).agg(offered=("offered", "sum"), answered=("answered", "sum"),
+                                           abandoned=("abandoned", "sum"),
+                                           within_sla=("answered_within_sla", "sum"),
+                                           w=("w", "sum"), aht_x=("aht_x", "sum")).reset_index()
+    out["service_level_pct"] = (out["within_sla"] / out["offered"] * 100).round(1)
+    out["abandon_rate_pct"] = (out["abandoned"] / out["offered"] * 100).round(1)
+    out["aht_sec"] = (out["aht_x"] / out["w"]).round(1)
+    return out.drop(columns=["w", "aht_x"])
+
+
+# --------------------------------------------------------------------------- #
+# Alerts
+# --------------------------------------------------------------------------- #
+def build_alerts(states: pd.DataFrame, daily: pd.DataFrame, calls: pd.DataFrame) -> pd.DataFrame:
+    alerts = []
+
+    for state, limit in LIMITS_MIN.items():
+        s = states[(states["state"] == state) & (states["duration_sec"] > limit * 60)]
+        for r in s.itertuples():
+            alerts.append(("LONG_" + state.upper().replace(" ", "_"), "MEDIUM", r.agent_id, r.start_time,
+                           f"{state} lasted {r.duration_sec / 60:.0f} min (limit {limit})"))
+
+    for r in daily[daily["adherence_pct"] < TARGETS["adherence_pct"]].itertuples():
+        alerts.append(("LOW_ADHERENCE", "HIGH", r.agent_id, pd.Timestamp(r.date),
+                       f"Adherence {r.adherence_pct}% (target {TARGETS['adherence_pct']}%)"))
+
+    busy = calls[calls["offered"] >= MIN_VOLUME_FOR_ALERT]
+    for r in busy[busy["service_level_pct"] < TARGETS["service_level_pct"]].itertuples():
+        alerts.append(("SL_BREACH", "HIGH", r.queue, r.interval_start,
+                       f"Service level {r.service_level_pct:.0f}% (target {TARGETS['service_level_pct']:.0f}%)"))
+    for r in busy[busy["abandon_rate_pct"] > TARGETS["abandon_rate_pct"]].itertuples():
+        alerts.append(("HIGH_ABANDON", "HIGH", r.queue, r.interval_start,
+                       f"Abandon rate {r.abandon_rate_pct:.0f}% (limit {TARGETS['abandon_rate_pct']:.0f}%)"))
+
+    out = pd.DataFrame(alerts, columns=["alert_type", "severity", "entity", "time", "detail"])
+    return out.sort_values("time").reset_index(drop=True)
+
+
+# --------------------------------------------------------------------------- #
+# Validation of the cleaned output
+# --------------------------------------------------------------------------- #
+def validate(states, sched, calls, daily) -> pd.DataFrame:
+    nxt = states.groupby("agent_id")["start_time"].shift(-1)
+    checks = {
+        "states: all end_time > start_time": bool((states["end_time"] > states["start_time"]).all()),
+        "states: no overlaps per agent": bool(not (states["end_time"] > nxt).any()),
+        "states: only canonical state names": bool(states["state"].isin(STATES).all()),
+        "states: no nulls in key columns": bool(not states[["agent_id", "state", "start_time", "end_time"]]
+                                                .isna().any().any()),
+        "schedule: all end_time > start_time": bool((sched["end_time"] > sched["start_time"]).all()),
+        "calls: answered + abandoned <= offered": bool((calls["answered"] + calls["abandoned"] <= calls["offered"]).all()),
+        "calls: within_sla <= answered": bool((calls["answered_within_sla"] <= calls["answered"]).all()),
+        "calls: no negative counts": bool((calls[["offered", "answered", "abandoned"]] >= 0).all().all()),
+        "adherence within 0-100": bool(daily["adherence_pct"].between(0, 100).all()),
+        "occupancy within 0-100": bool(daily["occupancy_pct"].dropna().between(0, 100).all()),
+    }
+    out = pd.DataFrame({"check": list(checks), "passed": list(checks.values())})
+    out["status"] = np.where(out["passed"], "PASS", "FAIL")
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Report
+# --------------------------------------------------------------------------- #
+def write_excel(path: Path, sheets: dict):
+    with pd.ExcelWriter(path, engine="openpyxl") as xw:
+        for name, frame in sheets.items():
+            frame.to_excel(xw, sheet_name=name[:31], index=False)
+        from openpyxl.styles import Font
+
+        for ws in xw.book.worksheets:
+            ws.freeze_panes = "A2"
+            for cell in ws[1]:
+                cell.font = Font(bold=True)
+            for col in ws.columns:
+                width = max(len(str(c.value)) if c.value is not None else 0 for c in col)
+                ws.column_dimensions[col[0].column_letter].width = min(width + 3, 45)
+
+
+def run(indir: Path, outdir: Path) -> bool:
+    outdir.mkdir(parents=True, exist_ok=True)
+    states_raw = load(indir / "agent_states.csv")
+    sched_raw = load(indir / "schedule.csv")
+    calls_raw = load(indir / "call_intervals.csv")
+
+    states, states_rej, s1 = clean_states(states_raw)
+    sched, s2 = clean_schedule(sched_raw)
+    calls, calls_rej, s3 = clean_calls(calls_raw)
+    cleaning_log = pd.DataFrame(s1 + s2 + s3, columns=["step", "rows_affected"])
+
+    adh = adherence_table(states, sched)
+    daily = agent_daily(states, adh)
+    teams = team_summary(daily)
+    qdaily = queue_daily(calls)
+    alerts = build_alerts(states, daily, calls)
+    validation = validate(states, sched, calls, daily)
+
+    states.to_csv(outdir / "agent_states_clean.csv", index=False)
+    states_rej.to_csv(outdir / "agent_states_rejected.csv", index=False)
+    calls.to_csv(outdir / "call_intervals_clean.csv", index=False)
+    calls_rej.to_csv(outdir / "call_intervals_rejected.csv", index=False)
+    alerts.to_csv(outdir / "alerts.csv", index=False)
+    write_excel(outdir / "rta_report.xlsx", {
+        "Cleaning Log": cleaning_log, "Validation": validation, "Team Summary": teams,
+        "Agent Daily": daily, "Queue Daily": qdaily, "Queue Intervals": calls, "Alerts": alerts})
+
+    log.info("Cleaning log:\n%s", cleaning_log.to_string(index=False))
+    log.info("Validation:\n%s", validation[["check", "status"]].to_string(index=False))
+    log.info("Team summary:\n%s", teams.to_string(index=False))
+    log.info("Alerts raised: %s\n%s", len(alerts), alerts["alert_type"].value_counts().to_string())
+    return bool((validation["status"] == "PASS").all())
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Real-Time Analyst data pipeline")
+    ap.add_argument("--indir", default="data/raw")
+    ap.add_argument("--outdir", default="output")
+    ap.add_argument("--watch", type=int, default=0, metavar="SECONDS",
+                    help="poll the input files and re-run whenever they change")
+    args = ap.parse_args()
+    indir, outdir = Path(args.indir), Path(args.outdir)
+
+    if not args.watch:
+        if not run(indir, outdir):
+            raise SystemExit("Validation failed")
+        return
+
+    last = None
+    log.info("Watching %s every %ss (Ctrl+C to stop)", indir, args.watch)
+    while True:
+        sig = tuple((p.stat().st_mtime for p in sorted(indir.glob("*.csv"))))
+        if sig != last:
+            last = sig
+            run(indir, outdir)
+        time.sleep(args.watch)
+
+
+if __name__ == "__main__":
+    main()
